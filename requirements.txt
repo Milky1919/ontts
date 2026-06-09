@@ -1,0 +1,5 @@
+discord.py[voice]
+aiohttp
+emoji
+python-dotenv
+PyNaCl

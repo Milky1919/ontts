@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  bot:
+    image: ghcr.io/milky1919/ontts:latest
+    container_name: ontts-prod
+    network_mode: host
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - TTS_API_URL=http://localhost:8770/tts
+      - TTS_API_KEY=${TTS_API_KEY}
+      - VC_CHANNEL_ID=${VC_CHANNEL_ID}
+    volumes:
+      - /opt/stacks/ontts/data:/app/data
+    restart: unless-stopped
