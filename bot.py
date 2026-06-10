@@ -22,10 +22,10 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 SETTINGS_PATH = os.environ.get("SETTINGS_FILE_PATH", "/app/data/settings.json")
 
 DEFAULT_SETTINGS = {
-    "caption": "落ち着いた、近い距離感の女性話者",
+    "caption": "落ち着いた声の女性アナウンサー、明瞭で淡々とした話し方、ニュース読み上げ風",
     "speed": 1.0,
     "steps": 40,
-    "seed": None,
+    "seed": 42,
     "text_channel_id": None,
     "vc_channel_id": None,
     "auto_join": True,
