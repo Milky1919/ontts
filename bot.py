@@ -37,6 +37,7 @@ DEFAULT_SETTINGS = {
 guild_queues = {}
 guild_play_tasks = {}
 voice_events = {}
+guild_keepalive_tasks = {}
 
 def load_settings():
     if not os.path.exists(SETTINGS_PATH):
@@ -161,6 +162,97 @@ async def fetch_tts_audio(text, settings, output_path):
                 resp_text = await response.text()
                 logger.error(f"TTS API returned status {response.status}: {resp_text}")
                 return False
+# TTS API Lifecycle Management Helpers
+def get_base_url():
+    url = os.environ.get("TTS_API_URL")
+    if not url:
+        return None
+    if url.endswith("/tts"):
+        return url[:-4]
+    if url.endswith("/tts/"):
+        return url[:-5]
+    return url
+
+async def call_api_post(endpoint):
+    base_url = get_base_url()
+    if not base_url:
+        logger.error("Base URL could not be determined.")
+        return None
+    url = f"{base_url}{endpoint}"
+    api_key = os.environ.get("TTS_API_KEY")
+    headers = {}
+    if api_key:
+        headers["X-API-Key"] = api_key
+        
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    logger.info(f"Successfully called {endpoint}")
+                    return await response.text()
+                else:
+                    logger.error(f"Failed to call {endpoint}: HTTP {response.status}")
+    except Exception as e:
+        logger.error(f"Error calling {endpoint}: {e}")
+    return None
+
+def start_load_model_background():
+    bot.loop.create_task(call_api_post("/load"))
+
+async def stop_keepalive_task(guild_id):
+    task = guild_keepalive_tasks.get(guild_id)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    if guild_id in guild_keepalive_tasks:
+        del guild_keepalive_tasks[guild_id]
+
+def start_keepalive_task(guild_id):
+    async def keepalive_loop():
+        logger.info(f"Start keepalive loop for guild {guild_id}")
+        try:
+            while True:
+                await asyncio.sleep(30)
+                guild = bot.get_guild(guild_id)
+                if not guild or not guild.voice_client or not guild.voice_client.is_connected():
+                    break
+                
+                resp = await call_api_post("/keepalive")
+                if resp:
+                    is_not_loaded = False
+                    try:
+                        data = json.loads(resp)
+                        if isinstance(data, dict):
+                            is_not_loaded = (data.get("status") == "not_loaded" or 
+                                             data.get("message") == "not_loaded" or
+                                             data.get("detail") == "not_loaded")
+                    except Exception:
+                        is_not_loaded = resp.strip() == "not_loaded"
+                        
+                    if is_not_loaded:
+                        logger.info("Keepalive returned not_loaded. Triggering load...")
+                        start_load_model_background()
+        except asyncio.CancelledError:
+            logger.info(f"Keepalive loop for guild {guild_id} was cancelled.")
+        except Exception as e:
+            logger.error(f"Error in keepalive loop for guild {guild_id}: {e}")
+
+    # Cancel previous task if any
+    if guild_id in guild_keepalive_tasks:
+        guild_keepalive_tasks[guild_id].cancel()
+        
+    guild_keepalive_tasks[guild_id] = bot.loop.create_task(keepalive_loop())
+
+async def handle_connect_setup(guild_id):
+    start_load_model_background()
+    start_keepalive_task(guild_id)
+
+async def handle_disconnect_cleanup(guild_id):
+    await stop_keepalive_task(guild_id)
+    await call_api_post("/unload")
 
 # Playback Queue Loop
 async def play_queue_loop(guild_id, default_text_channel):
@@ -273,6 +365,7 @@ async def on_ready():
                         try:
                             logger.info(f"Auto-connecting to {vc_channel.name} on startup...")
                             await vc_channel.connect()
+                            await handle_connect_setup(guild_id)
                             
                             text_ch_id = guild_settings.get("text_channel_id")
                             default_text_channel = guild.get_channel(text_ch_id) if text_ch_id else None
@@ -333,7 +426,12 @@ async def handle_tts_message(message):
 
 @bot.event
 async def on_voice_state_update(member, before, after):
+    # If bot itself is disconnected
     if member.id == bot.user.id:
+        if before.channel is not None and after.channel is None:
+            guild_id = member.guild.id
+            logger.info(f"Bot was disconnected from {before.channel.name} in guild {guild_id}. Cleaning up...")
+            await handle_disconnect_cleanup(guild_id)
         return
         
     guild = member.guild
@@ -351,6 +449,7 @@ async def on_voice_state_update(member, before, after):
             if len(non_bot_members) == 0:
                 logger.info(f"No members in voice channel {bot_channel.name}. Disconnecting...")
                 await vc.disconnect()
+                await handle_disconnect_cleanup(guild_id)
                 
                 # Clear queue
                 if guild_id in guild_queues:
@@ -373,6 +472,7 @@ async def on_voice_state_update(member, before, after):
                         try:
                             logger.info(f"Auto-joining voice channel {target_channel.name}...")
                             await target_channel.connect()
+                            await handle_connect_setup(guild_id)
                             
                             text_ch_id = guild_settings.get("text_channel_id")
                             default_text_channel = guild.get_channel(text_ch_id) if text_ch_id else None
@@ -692,8 +792,10 @@ async def tts_join(ctx):
         if vc:
             if vc.channel.id != target_channel.id:
                 await vc.move_to(target_channel)
+                await handle_connect_setup(guild_id)
         else:
             await target_channel.connect()
+            await handle_connect_setup(guild_id)
             
         await ctx.send(f"🔊 {target_channel.name} に接続しました。")
         start_play_loop(guild_id, ctx.channel)
@@ -705,10 +807,11 @@ async def tts_join(ctx):
 async def tts_leave(ctx):
     vc = ctx.guild.voice_client
     if vc:
+        guild_id = ctx.guild.id
         await vc.disconnect()
+        await handle_disconnect_cleanup(guild_id)
         await ctx.send("👋 ボイスチャンネルから切断しました。")
         
-        guild_id = ctx.guild.id
         if guild_id in guild_queues:
             while not guild_queues[guild_id].empty():
                 try:
