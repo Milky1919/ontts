@@ -39,6 +39,7 @@ guild_play_tasks = {}
 voice_events = {}
 guild_keepalive_tasks = {}
 connecting_guilds = set()
+_our_disconnect_guilds = set()
 
 def load_settings():
     if not os.path.exists(SETTINGS_PATH):
@@ -262,6 +263,10 @@ async def connect_to_vc(guild, channel, text_channel=None, send_message=False):
         return
         
     vc = guild.voice_client
+    # Treat stale (disconnected) VoiceClient as None
+    if vc and not vc.is_connected():
+        vc = None
+
     if vc and vc.is_connected() and vc.channel.id == channel.id:
         logger.info(f"Already connected to target channel {channel.name} in guild {guild_id}.")
         return
@@ -294,6 +299,7 @@ async def disconnect_from_vc(guild, text_channel=None):
     vc = guild.voice_client
     if vc:
         logger.info(f"Disconnecting from VC in guild {guild_id}...")
+        _our_disconnect_guilds.add(guild_id)
         await vc.disconnect()
         await handle_disconnect_cleanup(guild_id)
         if text_channel:
@@ -482,6 +488,12 @@ async def on_voice_state_update(member, before, after):
     # If bot itself is disconnected
     if member.id == bot.user.id:
         if before.channel is not None and after.channel is None:
+            # Skip cleanup if this was our own intentional disconnect
+            if guild_id in _our_disconnect_guilds:
+                logger.info(f"Bot disconnect in guild {guild_id} was intentional. Skipping duplicate cleanup.")
+                _our_disconnect_guilds.discard(guild_id)
+                return
+
             vc = guild.voice_client
             if not vc or not vc.is_connected():
                 logger.info(f"Bot was disconnected from {before.channel.name} in guild {guild_id}. Cleaning up...")
