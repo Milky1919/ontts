@@ -507,6 +507,10 @@ async def on_voice_state_update(member, before, after):
                             guild_queues[guild_id].task_done()
                         except asyncio.QueueEmpty:
                             break
+        elif before.channel is None and after.channel is not None:
+            # Bot reconnected (e.g. Discord internal reconnect) - re-trigger load and keepalive
+            logger.info(f"Bot reconnected to {after.channel.name} in guild {guild_id}. Re-triggering setup...")
+            await handle_connect_setup(guild_id)
         return
         
     settings = load_settings()
