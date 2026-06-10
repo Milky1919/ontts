@@ -38,6 +38,7 @@ guild_queues = {}
 guild_play_tasks = {}
 voice_events = {}
 guild_keepalive_tasks = {}
+connecting_guilds = set()
 
 def load_settings():
     if not os.path.exists(SETTINGS_PATH):
@@ -254,6 +255,62 @@ async def handle_disconnect_cleanup(guild_id):
     await stop_keepalive_task(guild_id)
     await call_api_post("/unload")
 
+async def connect_to_vc(guild, channel, text_channel=None, send_message=False):
+    guild_id = guild.id
+    if guild_id in connecting_guilds:
+        logger.info(f"Already connecting to VC in guild {guild_id}, skip.")
+        return
+        
+    vc = guild.voice_client
+    if vc and vc.is_connected() and vc.channel.id == channel.id:
+        logger.info(f"Already connected to target channel {channel.name} in guild {guild_id}.")
+        return
+
+    connecting_guilds.add(guild_id)
+    try:
+        if vc:
+            if vc.channel.id != channel.id:
+                logger.info(f"Moving to channel {channel.name} in guild {guild_id}...")
+                await vc.move_to(channel)
+                await handle_connect_setup(guild_id)
+        else:
+            logger.info(f"Connecting to channel {channel.name} in guild {guild_id}...")
+            await channel.connect()
+            await handle_connect_setup(guild_id)
+            
+        if text_channel and send_message:
+            await text_channel.send(f"🔊 {channel.name} に接続しました。")
+            
+        start_play_loop(guild_id, text_channel)
+    except Exception as e:
+        logger.error(f"Failed to connect to voice channel in guild {guild_id}: {e}")
+        if text_channel and send_message:
+            await text_channel.send(f"❌ ボイスチャンネルへの接続に失敗しました: {e}")
+    finally:
+        connecting_guilds.discard(guild_id)
+
+async def disconnect_from_vc(guild, text_channel=None):
+    guild_id = guild.id
+    vc = guild.voice_client
+    if vc:
+        logger.info(f"Disconnecting from VC in guild {guild_id}...")
+        await vc.disconnect()
+        await handle_disconnect_cleanup(guild_id)
+        if text_channel:
+            await text_channel.send("👋 ボイスチャンネルから切断しました。")
+        
+        # Clear queue
+        if guild_id in guild_queues:
+            while not guild_queues[guild_id].empty():
+                try:
+                    guild_queues[guild_id].get_nowait()
+                    guild_queues[guild_id].task_done()
+                except asyncio.QueueEmpty:
+                    break
+    else:
+        if text_channel:
+            await text_channel.send("❌ Botはボイスチャンネルに接続していません。")
+
 # Playback Queue Loop
 async def play_queue_loop(guild_id, default_text_channel):
     logger.info(f"Start play loop for guild {guild_id}")
@@ -362,16 +419,9 @@ async def on_ready():
                 if vc_channel:
                     non_bot_members = [m for m in vc_channel.members if not m.bot]
                     if len(non_bot_members) > 0:
-                        try:
-                            logger.info(f"Auto-connecting to {vc_channel.name} on startup...")
-                            await vc_channel.connect()
-                            await handle_connect_setup(guild_id)
-                            
-                            text_ch_id = guild_settings.get("text_channel_id")
-                            default_text_channel = guild.get_channel(text_ch_id) if text_ch_id else None
-                            start_play_loop(guild_id, default_text_channel)
-                        except Exception as e:
-                            logger.error(f"Failed to auto-connect to {vc_channel.name} on startup: {e}")
+                        text_ch_id = guild_settings.get("text_channel_id")
+                        default_text_channel = guild.get_channel(text_ch_id) if text_ch_id else None
+                        await connect_to_vc(guild, vc_channel, default_text_channel, send_message=False)
 
 @bot.event
 async def on_message(message):
@@ -426,29 +476,15 @@ async def handle_tts_message(message):
 
 @bot.event
 async def on_voice_state_update(member, before, after):
+    guild = member.guild
+    guild_id = guild.id
+    
     # If bot itself is disconnected
     if member.id == bot.user.id:
         if before.channel is not None and after.channel is None:
-            guild_id = member.guild.id
-            logger.info(f"Bot was disconnected from {before.channel.name} in guild {guild_id}. Cleaning up...")
-            await handle_disconnect_cleanup(guild_id)
-        return
-        
-    guild = member.guild
-    guild_id = guild.id
-    settings = load_settings()
-    guild_settings = get_guild_settings(guild_id, settings)
-    
-    vc = guild.voice_client
-    
-    # Auto Disconnect (if VC becomes empty)
-    if vc and vc.is_connected():
-        bot_channel = vc.channel
-        if before.channel and before.channel.id == bot_channel.id:
-            non_bot_members = [m for m in bot_channel.members if not m.bot]
-            if len(non_bot_members) == 0:
-                logger.info(f"No members in voice channel {bot_channel.name}. Disconnecting...")
-                await vc.disconnect()
+            vc = guild.voice_client
+            if not vc or not vc.is_connected():
+                logger.info(f"Bot was disconnected from {before.channel.name} in guild {guild_id}. Cleaning up...")
                 await handle_disconnect_cleanup(guild_id)
                 
                 # Clear queue
@@ -459,26 +495,33 @@ async def on_voice_state_update(member, before, after):
                             guild_queues[guild_id].task_done()
                         except asyncio.QueueEmpty:
                             break
+        return
+        
+    settings = load_settings()
+    guild_settings = get_guild_settings(guild_id, settings)
+    vc = guild.voice_client
+    
+    # Auto Disconnect (if VC becomes empty)
+    if vc and vc.is_connected():
+        bot_channel = vc.channel
+        if before.channel and before.channel.id == bot_channel.id:
+            non_bot_members = [m for m in bot_channel.members if not m.bot]
+            if len(non_bot_members) == 0:
+                logger.info(f"No members in voice channel {bot_channel.name}. Disconnecting...")
+                await disconnect_from_vc(guild, None)
                             
     # Auto Connect (if someone joins configured VC and bot is not connected)
     if guild_settings.get("auto_join", True):
         vc_ch_id = guild_settings.get("vc_channel_id")
         if vc_ch_id and after.channel and after.channel.id == vc_ch_id:
-            if not vc:
+            if not vc and guild_id not in connecting_guilds:
                 target_channel = guild.get_channel(vc_ch_id)
                 if target_channel:
                     non_bot_members = [m for m in target_channel.members if not m.bot]
                     if len(non_bot_members) > 0:
-                        try:
-                            logger.info(f"Auto-joining voice channel {target_channel.name}...")
-                            await target_channel.connect()
-                            await handle_connect_setup(guild_id)
-                            
-                            text_ch_id = guild_settings.get("text_channel_id")
-                            default_text_channel = guild.get_channel(text_ch_id) if text_ch_id else None
-                            start_play_loop(guild_id, default_text_channel)
-                        except Exception as e:
-                            logger.error(f"Failed to auto-join: {e}")
+                        text_ch_id = guild_settings.get("text_channel_id")
+                        default_text_channel = guild.get_channel(text_ch_id) if text_ch_id else None
+                        await connect_to_vc(guild, target_channel, default_text_channel, send_message=False)
 
 # Bot Commands
 @bot.command(name="help")
@@ -768,14 +811,15 @@ async def tts_ch(ctx):
 
 @bot.command(name="join")
 async def tts_join(ctx):
-    guild_id = ctx.guild.id
+    guild = ctx.guild
+    guild_id = guild.id
     settings = load_settings()
     guild_settings = get_guild_settings(guild_id, settings)
     vc_ch_id = guild_settings.get("vc_channel_id")
     
     target_channel = None
     if vc_ch_id:
-        target_channel = ctx.guild.get_channel(vc_ch_id)
+        target_channel = guild.get_channel(vc_ch_id)
         
     if not target_channel:
         if ctx.author.voice and ctx.author.voice.channel:
@@ -787,40 +831,11 @@ async def tts_join(ctx):
             await ctx.send("❌ エラー: 接続先のボイスチャンネルが設定されていないか、見つかりません。ボイスチャンネルに接続した状態でコマンドを実行してください。")
             return
             
-    try:
-        vc = ctx.guild.voice_client
-        if vc:
-            if vc.channel.id != target_channel.id:
-                await vc.move_to(target_channel)
-                await handle_connect_setup(guild_id)
-        else:
-            await target_channel.connect()
-            await handle_connect_setup(guild_id)
-            
-        await ctx.send(f"🔊 {target_channel.name} に接続しました。")
-        start_play_loop(guild_id, ctx.channel)
-    except Exception as e:
-        logger.error(f"Failed to join voice channel: {e}")
-        await ctx.send(f"❌ ボイスチャンネルへの接続に失敗しました: {e}")
+    await connect_to_vc(guild, target_channel, ctx.channel, send_message=True)
 
 @bot.command(name="leave")
 async def tts_leave(ctx):
-    vc = ctx.guild.voice_client
-    if vc:
-        guild_id = ctx.guild.id
-        await vc.disconnect()
-        await handle_disconnect_cleanup(guild_id)
-        await ctx.send("👋 ボイスチャンネルから切断しました。")
-        
-        if guild_id in guild_queues:
-            while not guild_queues[guild_id].empty():
-                try:
-                    guild_queues[guild_id].get_nowait()
-                    guild_queues[guild_id].task_done()
-                except asyncio.QueueEmpty:
-                    break
-    else:
-        await ctx.send("❌ Botはボイスチャンネルに接続していません。")
+    await disconnect_from_vc(ctx.guild, ctx.channel)
 
 @bot.command(name="skip")
 async def tts_skip(ctx):
