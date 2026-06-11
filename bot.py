@@ -22,7 +22,7 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 SETTINGS_PATH = os.environ.get("SETTINGS_FILE_PATH", "/app/data/settings.json")
 
 DEFAULT_SETTINGS = {
-    "caption": "落ち着いた声の女性アナウンサー、明瞭で淡々とした話し方、ニュース読み上げ風",
+    "caption": "落ち着いた大人の女性の声、はっきりとした明瞭な発音、一定の速さで安定した話し方、聞き取りやすいニュースアナウンス調",
     "speed": 1.0,
     "steps": 40,
     "seed": 42,
@@ -31,7 +31,8 @@ DEFAULT_SETTINGS = {
     "auto_join": True,
     "max_chars": 200,
     "dict": {},
-    "profiles": {}
+    "profiles": {},
+    "muted_users": []
 }
 
 # Global queue and tasks management
@@ -41,6 +42,7 @@ voice_events = {}
 guild_keepalive_tasks = {}
 connecting_guilds = set()
 _our_disconnect_guilds = set()
+interactive_sessions = {}  # (channel_id, user_id) -> active wizard count; replies are not read aloud
 
 def load_settings():
     if not os.path.exists(SETTINGS_PATH):
@@ -487,7 +489,15 @@ async def handle_tts_message(message):
     target_channel_id = guild_settings.get("text_channel_id")
     if target_channel_id and message.channel.id != target_channel_id:
         return
-        
+
+    # Skip users whose readout is turned off via .tts profile
+    if message.author.id in guild_settings.get("muted_users", []):
+        return
+
+    # Skip replies to interactive setup wizards (channel/VC selection, profile)
+    if (message.channel.id, message.author.id) in interactive_sessions:
+        return
+
     vc = guild.voice_client
     if not vc or not vc.is_connected():
         return
@@ -571,6 +581,25 @@ async def on_voice_state_update(member, before, after):
                         await connect_to_vc(guild, target_channel, default_text_channel, send_message=False)
 
 # Interactive Selection Helpers
+def mark_interactive(ctx):
+    key = (ctx.channel.id, ctx.author.id)
+    interactive_sessions[key] = interactive_sessions.get(key, 0) + 1
+
+def unmark_interactive(ctx):
+    key = (ctx.channel.id, ctx.author.id)
+
+    def release():
+        count = interactive_sessions.get(key, 0)
+        if count <= 1:
+            interactive_sessions.pop(key, None)
+        else:
+            interactive_sessions[key] = count - 1
+
+    # Release after a delay: the reply that ended the wait is dispatched to
+    # on_message as a separate task that runs after this coroutine resumes,
+    # so removing the key immediately would let that reply be read aloud.
+    bot.loop.call_later(1.0, release)
+
 async def wait_for_number(ctx, max_num, timeout=30.0):
     def check(message):
         return (
@@ -579,11 +608,14 @@ async def wait_for_number(ctx, max_num, timeout=30.0):
             and message.content.isdigit()
         )
 
+    mark_interactive(ctx)
     try:
         reply = await bot.wait_for("message", timeout=timeout, check=check)
     except asyncio.TimeoutError:
         await ctx.send("⏰ タイムアウトしました。操作をキャンセルします。")
         return None
+    finally:
+        unmark_interactive(ctx)
 
     num = int(reply.content)
     if not (1 <= num <= max_num):
@@ -695,7 +727,7 @@ async def tts_help(ctx):
             "`.tts set autojoin <on|off>` - 自動接続の有効/無効を切り替えます\n"
             "`.tts set ch` - 読み上げ対象のテキストチャンネルを設定します（番号選択）\n"
             "`.tts set vc` - 自動接続先のボイスチャンネルを設定します（番号選択）\n"
-            "`.tts profile` - ユーザーごとの声質（caption）を設定します（番号選択）\n"
+            "`.tts profile` - ユーザーごとの声質（caption）と読み上げON/OFFを設定します（番号選択）\n"
             "`.tts reset` - 設定をすべてデフォルト値に戻します (確認あり)\n"
             "`.tts join` - あなたがいるVC、または設定済みVCに接続します\n"
             "`.tts leave` - ボイスチャンネルから切断します\n"
@@ -712,9 +744,10 @@ async def tts_help(ctx):
         name="💡 設定パラメータの詳細説明",
         value=(
             "**caption (話者キャプション) の例:**\n"
-            "・`落ち着いた、近い距離感の女性話者` (デフォルト)\n"
-            "・`明るい男性話者`\n"
-            "・`元気な女の子の声`\n\n"
+            "・`落ち着いた大人の女性の声、はっきりとした明瞭な発音、一定の速さで安定した話し方、聞き取りやすいニュースアナウンス調` (デフォルト)\n"
+            "・`低めの落ち着いた男性の声、ゆっくりと丁寧な話し方`\n"
+            "・`高めの明るい女の子の声、元気でハキハキした話し方`\n"
+            "※「声の高さ・性別」「発音」「話し方」を組み合わせて書くと安定します。\n\n"
             "**speed (読み上げ速度):**\n"
             "推奨範囲: `0.5` 〜 `2.0` (0.1〜3.0まで設定可能)\n\n"
             "**steps (推論ステップ数):**\n"
@@ -765,6 +798,7 @@ async def tts_status(ctx):
 
     dict_count = len(guild_settings.get("dict", {}))
     profile_count = len(guild_settings.get("profiles", {}))
+    muted_count = len(guild_settings.get("muted_users", []))
 
     status_text = (
         "📊 現在の設定 (デフォルト値)\n"
@@ -779,6 +813,7 @@ async def tts_status(ctx):
         f"vc        : {vc_channel_str}\n"
         f"dict      : {dict_count}件登録済み\n"
         f"profile   : {profile_count}人設定済み\n"
+        f"mute      : {muted_count}人 読み上げOFF\n"
     )
     
     await ctx.send(f"```\n{status_text}```\n* デフォルトから変更されている項目には末尾に * がついています。")
@@ -1086,6 +1121,7 @@ async def tts_profile(ctx):
 
     max_display = 30
     display_members = members[:max_display]
+    muted_users = guild_settings.get("muted_users", [])
 
     lines = []
     for i, m in enumerate(display_members):
@@ -1094,7 +1130,8 @@ async def tts_profile(ctx):
             cap_str = caption[:20] + "…" if len(caption) > 20 else caption
         else:
             cap_str = "デフォルト"
-        lines.append(f"{i+1}: {m.display_name} [{cap_str}]")
+        mute_str = " 🔇読み上げOFF" if m.id in muted_users else ""
+        lines.append(f"{i+1}: {m.display_name} [{cap_str}]{mute_str}")
 
     member_list_str = "\n".join(lines)
     suffix = f"\n他 {len(members) - max_display} 人（表示は先頭{max_display}人まで）" if len(members) > max_display else ""
@@ -1112,19 +1149,35 @@ async def tts_profile(ctx):
     target = display_members[num-1]
     current_caption = profiles.get(str(target.id))
     current_str = current_caption if current_caption else "デフォルト（サーバー設定を使用）"
+    is_muted = target.id in muted_users
+    mute_state = "OFF 🔇" if is_muted else "ON 🔊"
 
     await ctx.send(
-        f"👤 **{target.display_name}** の現在のcaption: `{current_str}`\n"
-        f"```\n1: captionを設定\n2: リセット（デフォルトに戻す）\n3: キャンセル```\n"
+        f"👤 **{target.display_name}** の現在の設定\n"
+        f"caption: `{current_str}` ／ 読み上げ: {mute_state}\n"
+        f"```\n1: captionを設定\n2: captionをリセット（デフォルトに戻す）\n3: 読み上げのON/OFFを切り替え\n4: キャンセル```\n"
         f"**操作の番号を返信してください（30秒以内）**"
     )
 
-    action = await wait_for_number(ctx, 3)
+    action = await wait_for_number(ctx, 4)
     if action is None:
         return
 
-    if action == 3:
+    if action == 4:
         await ctx.send("↩️ キャンセルしました。")
+        return
+
+    if action == 3:
+        if is_muted:
+            muted_users.remove(target.id)
+            result_msg = f"🔊 {target.display_name} の読み上げを `ON` にしました。"
+        else:
+            muted_users.append(target.id)
+            result_msg = f"🔇 {target.display_name} の読み上げを `OFF` にしました。このユーザーのメッセージは読み上げられません。"
+        guild_settings["muted_users"] = muted_users
+        settings[str(guild_id)] = guild_settings
+        save_settings(settings)
+        await ctx.send(result_msg)
         return
 
     if action == 2:
@@ -1139,19 +1192,24 @@ async def tts_profile(ctx):
         return
 
     # action == 1: prompt for caption text
+    server_caption = guild_settings.get("caption", DEFAULT_SETTINGS["caption"])
     await ctx.send(
         f"✏️ {target.display_name} に設定するcaptionテキストを入力してください（60秒以内）\n"
-        f"例: `明るく元気な男性話者`"
+        f"参考（サーバーデフォルト）: `{server_caption}`\n"
+        f"例: `低めの落ち着いた男性の声、ゆっくりと丁寧な話し方` ／ `高めの明るい女の子の声、元気でハキハキした話し方`"
     )
 
     def text_check(message):
         return message.author == ctx.author and message.channel == ctx.channel
 
+    mark_interactive(ctx)
     try:
         reply = await bot.wait_for("message", timeout=60.0, check=text_check)
     except asyncio.TimeoutError:
         await ctx.send("⏰ タイムアウトしました。caption設定をキャンセルします。")
         return
+    finally:
+        unmark_interactive(ctx)
 
     caption_text = reply.content.strip()
     if not caption_text:
