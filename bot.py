@@ -30,7 +30,8 @@ DEFAULT_SETTINGS = {
     "vc_channel_id": None,
     "auto_join": True,
     "max_chars": 200,
-    "dict": {}
+    "dict": {},
+    "profiles": {}
 }
 
 # Global queue and tasks management
@@ -134,17 +135,23 @@ def preprocess_text(text, guild, settings):
     return text.strip()
 
 # TTS API Client
+class TTSAPIError(Exception):
+    """TTS API failure with a user-facing message."""
+    def __init__(self, user_message):
+        super().__init__(user_message)
+        self.user_message = user_message
+
 async def fetch_tts_audio(text, settings, output_path):
     api_url = os.environ.get("TTS_API_URL")
     api_key = os.environ.get("TTS_API_KEY")
-    
+
     if not api_url:
-        raise ValueError("TTS_API_URL is not configured in environment variables.")
-        
+        raise TTSAPIError("TTS APIのURLが設定されていません。Bot管理者は環境変数 `TTS_API_URL` を設定してください。")
+
     headers = {}
     if api_key:
         headers["X-API-Key"] = api_key
-        
+
     payload = {
         "text": text,
         "caption": settings.get("caption", DEFAULT_SETTINGS["caption"]),
@@ -152,18 +159,30 @@ async def fetch_tts_audio(text, settings, output_path):
         "num_steps": settings.get("steps", DEFAULT_SETTINGS["steps"]),
         "seed": settings.get("seed", DEFAULT_SETTINGS["seed"])
     }
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.post(api_url, json=payload, headers=headers, timeout=30) as response:
-            if response.status == 200:
-                data = await response.read()
-                with open(output_path, "wb") as f:
-                    f.write(data)
-                return True
-            else:
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(api_url, json=payload, headers=headers, timeout=30) as response:
+                if response.status == 200:
+                    data = await response.read()
+                    with open(output_path, "wb") as f:
+                        f.write(data)
+                    return
                 resp_text = await response.text()
                 logger.error(f"TTS API returned status {response.status}: {resp_text}")
-                return False
+                detail = resp_text.strip()[:100]
+                msg = f"TTS APIがエラーを返しました (HTTP {response.status})"
+                if response.status == 503:
+                    msg += "。モデルが未ロードの可能性があります。少し待ってから再試行してください"
+                if detail:
+                    msg += f"\n詳細: `{detail}`"
+                raise TTSAPIError(msg)
+    except aiohttp.ClientConnectorError as e:
+        logger.error(f"TTS API connection error: {e}")
+        raise TTSAPIError("TTS APIサーバーに接続できません。サーバーが起動しているか、`TTS_API_URL` の設定を確認してください。")
+    except asyncio.TimeoutError:
+        logger.error("TTS API request timed out.")
+        raise TTSAPIError("TTS APIの応答がタイムアウトしました。モデルのロード中か高負荷の可能性があります。しばらく待ってから再試行してください。")
 # TTS API Lifecycle Management Helpers
 def get_base_url():
     url = os.environ.get("TTS_API_URL")
@@ -290,7 +309,10 @@ async def connect_to_vc(guild, channel, text_channel=None, send_message=False):
     except Exception as e:
         logger.error(f"Failed to connect to voice channel in guild {guild_id}: {e}")
         if text_channel and send_message:
-            await text_channel.send(f"❌ ボイスチャンネルへの接続に失敗しました: {e}")
+            await text_channel.send(
+                f"❌ ボイスチャンネル `{channel.name}` への接続に失敗しました: {e}\n"
+                f"Botにそのチャンネルへの「接続」「発言」権限があるか確認してください。"
+            )
     finally:
         connecting_guilds.discard(guild_id)
 
@@ -338,20 +360,28 @@ async def play_queue_loop(guild_id, default_text_channel):
             
             settings = load_settings()
             guild_settings = get_guild_settings(guild_id, settings)
-            
+
+            # Apply per-user profile caption if configured
+            tts_settings = dict(guild_settings)
+            author_id = item.get("author_id")
+            if author_id is not None:
+                profile_caption = guild_settings.get("profiles", {}).get(str(author_id))
+                if profile_caption:
+                    tts_settings["caption"] = profile_caption
+
             # API Call
             temp_file_path = f"temp_{guild_id}_{int(time.time())}.wav"
             try:
-                success = await fetch_tts_audio(text, guild_settings, temp_file_path)
-                if not success:
-                    if channel:
-                        await channel.send("❌ TTS API からの音声生成に失敗しました。")
-                    guild_queues[guild_id].task_done()
-                    continue
+                await fetch_tts_audio(text, tts_settings, temp_file_path)
+            except TTSAPIError as e:
+                if channel:
+                    await channel.send(f"❌ 音声生成に失敗しました。\n{e.user_message}")
+                guild_queues[guild_id].task_done()
+                continue
             except Exception as e:
                 logger.error(f"Failed to fetch TTS: {e}")
                 if channel:
-                    await channel.send(f"❌ TTS API エラーが発生しました: {e}")
+                    await channel.send(f"❌ TTS API で予期しないエラーが発生しました: {e}")
                 guild_queues[guild_id].task_done()
                 continue
                 
@@ -475,7 +505,8 @@ async def handle_tts_message(message):
         
     await guild_queues[guild_id].put({
         "text": processed_text,
-        "text_channel": message.channel
+        "text_channel": message.channel,
+        "author_id": message.author.id
     })
     
     start_play_loop(guild_id, message.channel)
@@ -539,6 +570,110 @@ async def on_voice_state_update(member, before, after):
                         default_text_channel = guild.get_channel(text_ch_id) if text_ch_id else None
                         await connect_to_vc(guild, target_channel, default_text_channel, send_message=False)
 
+# Interactive Selection Helpers
+async def wait_for_number(ctx, max_num, timeout=30.0):
+    def check(message):
+        return (
+            message.author == ctx.author
+            and message.channel == ctx.channel
+            and message.content.isdigit()
+        )
+
+    try:
+        reply = await bot.wait_for("message", timeout=timeout, check=check)
+    except asyncio.TimeoutError:
+        await ctx.send("⏰ タイムアウトしました。操作をキャンセルします。")
+        return None
+
+    num = int(reply.content)
+    if not (1 <= num <= max_num):
+        await ctx.send(f"❌ エラー: `1` から `{max_num}` の番号を入力してください。操作をキャンセルします。")
+        return None
+    return num
+
+async def setup_text_channel(ctx):
+    channels = [c for c in ctx.guild.text_channels if c.permissions_for(ctx.guild.me).send_messages]
+    if not channels:
+        await ctx.send("❌ Botが送信可能なテキストチャンネルが見つかりません。Botのロール権限（メッセージの送信）を確認してください。")
+        return
+
+    guild_id = ctx.guild.id
+    settings = load_settings()
+    guild_settings = get_guild_settings(guild_id, settings)
+    curr_ch_id = guild_settings.get("text_channel_id")
+
+    if curr_ch_id:
+        curr_ch = ctx.guild.get_channel(curr_ch_id)
+        curr_ch_name = f"#{curr_ch.name}" if curr_ch else "不明（削除された可能性があります）"
+    else:
+        curr_ch_name = "未設定"
+
+    ch_list_str = "\n".join([f"{i+1}: #{c.name}" for i, c in enumerate(channels)])
+
+    await ctx.send(
+        f"📋 **テキストチャンネル一覧**\n"
+        f"```\n{ch_list_str}```\n"
+        f"現在の読み上げチャンネル: `{curr_ch_name}`\n"
+        f"**番号を返信してください（30秒以内）**"
+    )
+
+    num = await wait_for_number(ctx, len(channels))
+    if num is None:
+        return
+
+    selected_ch = channels[num-1]
+    guild_settings["text_channel_id"] = selected_ch.id
+    settings[str(guild_id)] = guild_settings
+    save_settings(settings)
+    await ctx.send(f"✅ 読み上げ対象チャンネルを #{selected_ch.name} に変更しました。")
+
+async def setup_vc_channel(ctx):
+    channels = [c for c in ctx.guild.voice_channels if c.permissions_for(ctx.guild.me).connect]
+    if not channels:
+        await ctx.send("❌ Botが接続可能なボイスチャンネルが見つかりません。Botのロール権限（接続）を確認してください。")
+        return
+
+    guild_id = ctx.guild.id
+    settings = load_settings()
+    guild_settings = get_guild_settings(guild_id, settings)
+    curr_vc_id = guild_settings.get("vc_channel_id")
+
+    if curr_vc_id:
+        curr_vc = ctx.guild.get_channel(curr_vc_id)
+        curr_vc_name = f"#{curr_vc.name}" if curr_vc else "不明（削除された可能性があります）"
+    else:
+        curr_vc_name = "未設定"
+
+    ch_list_str = "\n".join([f"{i+1}: #{c.name}" for i, c in enumerate(channels)])
+
+    await ctx.send(
+        f"📋 **ボイスチャンネル一覧**\n"
+        f"```\n{ch_list_str}```\n"
+        f"現在の接続先チャンネル: `{curr_vc_name}`\n"
+        f"**番号を返信してください（30秒以内）**"
+    )
+
+    num = await wait_for_number(ctx, len(channels))
+    if num is None:
+        return
+
+    selected_ch = channels[num-1]
+    guild_settings["vc_channel_id"] = selected_ch.id
+    settings[str(guild_id)] = guild_settings
+    save_settings(settings)
+    await ctx.send(
+        f"✅ 接続先ボイスチャンネルを #{selected_ch.name} に設定しました。\n"
+        f"auto_join がONの間、このチャンネルに自動接続します。"
+    )
+
+    # If auto_join is on and members are already in the channel, connect right away
+    vc = ctx.guild.voice_client
+    already_connected = vc and vc.is_connected() and vc.channel.id == selected_ch.id
+    if guild_settings.get("auto_join", True) and not already_connected:
+        non_bot_members = [m for m in selected_ch.members if not m.bot]
+        if non_bot_members:
+            await connect_to_vc(ctx.guild, selected_ch, ctx.channel, send_message=True)
+
 # Bot Commands
 @bot.command(name="help")
 async def tts_help(ctx):
@@ -558,9 +693,11 @@ async def tts_help(ctx):
             "`.tts set seed <数値|random>` - シード値を変更します\n"
             "`.tts set maxchars <数値>` - 読み上げる最大文字数を変更します (50〜1000)\n"
             "`.tts set autojoin <on|off>` - 自動接続の有効/無効を切り替えます\n"
+            "`.tts set ch` - 読み上げ対象のテキストチャンネルを設定します（番号選択）\n"
+            "`.tts set vc` - 自動接続先のボイスチャンネルを設定します（番号選択）\n"
+            "`.tts profile` - ユーザーごとの声質（caption）を設定します（番号選択）\n"
             "`.tts reset` - 設定をすべてデフォルト値に戻します (確認あり)\n"
-            "`.tts ch` - 読み上げ対象のテキストチャンネルを変更します\n"
-            "`.tts join` - ボイスチャンネルに接続します\n"
+            "`.tts join` - あなたがいるVC、または設定済みVCに接続します\n"
             "`.tts leave` - ボイスチャンネルから切断します\n"
             "`.tts skip` - 現在再生中の音声をスキップします\n"
             "`.tts clear` - 再生キューをクリアします\n"
@@ -624,9 +761,11 @@ async def tts_status(ctx):
     max_chars_str = get_val_str("max_chars", DEFAULT_SETTINGS["max_chars"], guild_settings.get("max_chars"))
     auto_join_str = get_val_str("auto_join", DEFAULT_SETTINGS["auto_join"], guild_settings.get("auto_join"), is_bool=True)
     channel_str = get_val_str("text_channel_id", DEFAULT_SETTINGS["text_channel_id"], guild_settings.get("text_channel_id"), is_channel=True)
-    
+    vc_channel_str = get_val_str("vc_channel_id", DEFAULT_SETTINGS["vc_channel_id"], guild_settings.get("vc_channel_id"), is_channel=True)
+
     dict_count = len(guild_settings.get("dict", {}))
-    
+    profile_count = len(guild_settings.get("profiles", {}))
+
     status_text = (
         "📊 現在の設定 (デフォルト値)\n"
         "─────────────────────────────\n"
@@ -637,14 +776,27 @@ async def tts_status(ctx):
         f"max_chars : {max_chars_str}\n"
         f"auto_join : {auto_join_str}\n"
         f"channel   : {channel_str}\n"
+        f"vc        : {vc_channel_str}\n"
         f"dict      : {dict_count}件登録済み\n"
+        f"profile   : {profile_count}人設定済み\n"
     )
     
     await ctx.send(f"```\n{status_text}```\n* デフォルトから変更されている項目には末尾に * がついています。")
 
 @bot.group(name="set", invoke_without_command=True)
 async def tts_set(ctx):
-    await ctx.send("`.tts set` の後に `caption`, `speed`, `steps`, `seed`, `maxchars`, `autojoin` を指定してください。")
+    await ctx.send(
+        "`.tts set` の後に `caption`, `speed`, `steps`, `seed`, `maxchars`, `autojoin`, `ch`, `vc` を指定してください。\n"
+        "詳しくは `.tts help` を参照してください。"
+    )
+
+@tts_set.command(name="ch")
+async def set_ch(ctx):
+    await setup_text_channel(ctx)
+
+@tts_set.command(name="vc")
+async def set_vc(ctx):
+    await setup_vc_channel(ctx)
 
 @tts_set.command(name="caption")
 async def set_caption(ctx, *, text: str):
@@ -748,7 +900,11 @@ async def set_autojoin(ctx, value: str):
 
 @bot.command(name="reset")
 async def tts_reset(ctx):
-    msg = await ctx.send("⚠️ サーバーの全設定をデフォルト値に戻しますか？\n実行するには 30秒以内に ✅ リアクションを押してください。")
+    msg = await ctx.send(
+        "⚠️ サーバーの全設定をデフォルト値に戻しますか？\n"
+        "（ユーザーごとのprofile設定やカスタム辞書も消えます）\n"
+        "実行するには 30秒以内に ✅ リアクションを押してください。"
+    )
     await msg.add_reaction("✅")
     
     def check(reaction, user):
@@ -776,54 +932,11 @@ async def tts_reset(ctx):
         save_settings(settings)
         await ctx.send("✅ 設定をすべてデフォルト値にリセットしました。")
 
+# Backward-compat alias for `.tts set ch`
 @bot.command(name="ch")
 async def tts_ch(ctx):
-    channels = [c for c in ctx.guild.text_channels if c.permissions_for(ctx.guild.me).send_messages]
-    if not channels:
-        await ctx.send("❌ 送信可能なテキストチャンネルが見つかりません。")
-        return
-        
-    guild_id = ctx.guild.id
-    settings = load_settings()
-    guild_settings = get_guild_settings(guild_id, settings)
-    curr_ch_id = guild_settings.get("text_channel_id")
-    
-    if curr_ch_id:
-        curr_ch = ctx.guild.get_channel(curr_ch_id)
-        curr_ch_name = f"#{curr_ch.name}" if curr_ch else "不明"
-    else:
-        curr_ch_name = "未設定"
-        
-    ch_list_str = "\n".join([f"{i+1}: #{c.name}" for i, c in enumerate(channels)])
-    
-    await ctx.send(
-        f"📋 **チャンネル一覧**\n"
-        f"```\n{ch_list_str}```\n"
-        f"現在の読み上げチャンネル: `{curr_ch_name}`\n"
-        f"**番号を返信してください（30秒以内）**"
-    )
-    
-    def check(message):
-        return (
-            message.author == ctx.author
-            and message.channel == ctx.channel
-            and message.content.isdigit()
-        )
-        
-    try:
-        reply = await bot.wait_for("message", timeout=30.0, check=check)
-    except asyncio.TimeoutError:
-        await ctx.send("⏰ タイムアウトしました。チャンネル変更をキャンセルします。")
-    else:
-        num = int(reply.content)
-        if 1 <= num <= len(channels):
-            selected_ch = channels[num-1]
-            guild_settings["text_channel_id"] = selected_ch.id
-            settings[str(guild_id)] = guild_settings
-            save_settings(settings)
-            await ctx.send(f"✅ 読み上げ対象チャンネルを #{selected_ch.name} に変更しました。")
-        else:
-            await ctx.send("❌ エラー: 無効な番号が指定されました。チャンネル変更をキャンセルします。")
+    await ctx.send("ℹ️ `.tts ch` は旧形式です。今後は `.tts set ch` をご利用ください。")
+    await setup_text_channel(ctx)
 
 @bot.command(name="join")
 async def tts_join(ctx):
@@ -832,21 +945,34 @@ async def tts_join(ctx):
     settings = load_settings()
     guild_settings = get_guild_settings(guild_id, settings)
     vc_ch_id = guild_settings.get("vc_channel_id")
-    
-    target_channel = None
-    if vc_ch_id:
-        target_channel = guild.get_channel(vc_ch_id)
-        
-    if not target_channel:
-        if ctx.author.voice and ctx.author.voice.channel:
-            target_channel = ctx.author.voice.channel
+
+    # Priority 1: the channel the command author is currently in
+    if ctx.author.voice and ctx.author.voice.channel:
+        target_channel = ctx.author.voice.channel
+        if not vc_ch_id:
             guild_settings["vc_channel_id"] = target_channel.id
             settings[str(guild_id)] = guild_settings
             save_settings(settings)
-        else:
-            await ctx.send("❌ エラー: 接続先のボイスチャンネルが設定されていないか、見つかりません。ボイスチャンネルに接続した状態でコマンドを実行してください。")
+            await ctx.send(
+                f"📌 #{target_channel.name} を自動接続（auto_join）の対象として保存しました。\n"
+                f"変更したい場合は `.tts set vc` で再設定できます。"
+            )
+    # Priority 2: the configured vc_channel_id
+    elif vc_ch_id:
+        target_channel = guild.get_channel(vc_ch_id)
+        if not target_channel:
+            await ctx.send(
+                "❌ 設定されているボイスチャンネルが見つかりません（削除された可能性があります）。\n"
+                "`.tts set vc` で接続先を再設定するか、ボイスチャンネルに参加してから `.tts join` を実行してください。"
+            )
             return
-            
+    else:
+        await ctx.send(
+            "❌ 接続先のボイスチャンネルがありません。\n"
+            "ボイスチャンネルに参加してから `.tts join` を実行するか、`.tts set vc` で接続先を設定してください。"
+        )
+        return
+
     await connect_to_vc(guild, target_channel, ctx.channel, send_message=True)
 
 @bot.command(name="leave")
@@ -945,6 +1071,98 @@ async def dict_list(ctx):
         
     dict_str = "\n".join([f"• `{k}` ➔ `{v}`" for k, v in custom_dict.items()])
     await ctx.send(f"📖 **カスタム辞書一覧 ({len(custom_dict)} 件)**\n{dict_str}")
+
+@bot.command(name="profile")
+async def tts_profile(ctx):
+    guild_id = ctx.guild.id
+    settings = load_settings()
+    guild_settings = get_guild_settings(guild_id, settings)
+    profiles = guild_settings.get("profiles", {})
+
+    members = [m for m in ctx.guild.members if not m.bot]
+    if not members:
+        await ctx.send("❌ 表示できるメンバーが見つかりません。")
+        return
+
+    max_display = 30
+    display_members = members[:max_display]
+
+    lines = []
+    for i, m in enumerate(display_members):
+        caption = profiles.get(str(m.id))
+        if caption:
+            cap_str = caption[:20] + "…" if len(caption) > 20 else caption
+        else:
+            cap_str = "デフォルト"
+        lines.append(f"{i+1}: {m.display_name} [{cap_str}]")
+
+    member_list_str = "\n".join(lines)
+    suffix = f"\n他 {len(members) - max_display} 人（表示は先頭{max_display}人まで）" if len(members) > max_display else ""
+
+    await ctx.send(
+        f"👤 **メンバー一覧（caption設定状況）**\n"
+        f"```\n{member_list_str}{suffix}```\n"
+        f"**設定するメンバーの番号を返信してください（30秒以内）**"
+    )
+
+    num = await wait_for_number(ctx, len(display_members))
+    if num is None:
+        return
+
+    target = display_members[num-1]
+    current_caption = profiles.get(str(target.id))
+    current_str = current_caption if current_caption else "デフォルト（サーバー設定を使用）"
+
+    await ctx.send(
+        f"👤 **{target.display_name}** の現在のcaption: `{current_str}`\n"
+        f"```\n1: captionを設定\n2: リセット（デフォルトに戻す）\n3: キャンセル```\n"
+        f"**操作の番号を返信してください（30秒以内）**"
+    )
+
+    action = await wait_for_number(ctx, 3)
+    if action is None:
+        return
+
+    if action == 3:
+        await ctx.send("↩️ キャンセルしました。")
+        return
+
+    if action == 2:
+        if str(target.id) in profiles:
+            del profiles[str(target.id)]
+            guild_settings["profiles"] = profiles
+            settings[str(guild_id)] = guild_settings
+            save_settings(settings)
+            await ctx.send(f"✅ {target.display_name} のcaptionをリセットしました。今後はサーバーのデフォルトcaptionを使用します。")
+        else:
+            await ctx.send(f"ℹ️ {target.display_name} のcaptionはもともとデフォルトです。変更はありません。")
+        return
+
+    # action == 1: prompt for caption text
+    await ctx.send(
+        f"✏️ {target.display_name} に設定するcaptionテキストを入力してください（60秒以内）\n"
+        f"例: `明るく元気な男性話者`"
+    )
+
+    def text_check(message):
+        return message.author == ctx.author and message.channel == ctx.channel
+
+    try:
+        reply = await bot.wait_for("message", timeout=60.0, check=text_check)
+    except asyncio.TimeoutError:
+        await ctx.send("⏰ タイムアウトしました。caption設定をキャンセルします。")
+        return
+
+    caption_text = reply.content.strip()
+    if not caption_text:
+        await ctx.send("❌ captionが空です。設定をキャンセルします。")
+        return
+
+    profiles[str(target.id)] = caption_text
+    guild_settings["profiles"] = profiles
+    settings[str(guild_id)] = guild_settings
+    save_settings(settings)
+    await ctx.send(f"✅ {target.display_name} のcaptionを `{caption_text}` に設定しました。")
 
 # Run Bot
 if __name__ == "__main__":
