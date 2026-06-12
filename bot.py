@@ -32,6 +32,7 @@ DEFAULT_SETTINGS = {
     "max_chars": 200,
     "dict": {},
     "profiles": {},
+    "profile_seeds": {},
     "muted_users": []
 }
 
@@ -114,15 +115,14 @@ def preprocess_text(text, guild, settings):
     if temp_text == "":
         return None
         
-    # 4. Emoji Processing
+    # 4. Emoji Processing (emojis are removed, not read aloud)
     try:
-        demojized = emoji.demojize(text, language='ja')
-        text = re.sub(r':([^:]+):', r'\1', demojized)
+        text = emoji.replace_emoji(text, replace='')
     except Exception as e:
-        logger.error(f"Emoji demojize error: {e}")
-        
-    # Discord Custom Emojis
-    text = re.sub(r'<a?:([^:]+):\d+>', r'\1', text)
+        logger.error(f"Emoji removal error: {e}")
+
+    # Discord Custom Emojis (removed as well)
+    text = re.sub(r'<a?:[^:]+:\d+>', '', text)
     
     # 5. Custom Dictionary Replacement
     custom_dict = settings.get("dict", {})
@@ -363,13 +363,17 @@ async def play_queue_loop(guild_id, default_text_channel):
             settings = load_settings()
             guild_settings = get_guild_settings(guild_id, settings)
 
-            # Apply per-user profile caption if configured
+            # Apply per-user profile caption / seed if configured
             tts_settings = dict(guild_settings)
             author_id = item.get("author_id")
             if author_id is not None:
                 profile_caption = guild_settings.get("profiles", {}).get(str(author_id))
                 if profile_caption:
                     tts_settings["caption"] = profile_caption
+                profile_seeds = guild_settings.get("profile_seeds", {})
+                if str(author_id) in profile_seeds:
+                    # None means random seed, so check key presence instead of truthiness
+                    tts_settings["seed"] = profile_seeds[str(author_id)]
 
             # API Call
             temp_file_path = f"temp_{guild_id}_{int(time.time())}.wav"
@@ -727,7 +731,7 @@ async def tts_help(ctx):
             "`.tts set autojoin <on|off>` - 自動接続の有効/無効を切り替えます\n"
             "`.tts set ch` - 読み上げ対象のテキストチャンネルを設定します（番号選択）\n"
             "`.tts set vc` - 自動接続先のボイスチャンネルを設定します（番号選択）\n"
-            "`.tts profile` - ユーザーごとの声質（caption）と読み上げON/OFFを設定します（番号選択）\n"
+            "`.tts profile` - ユーザーごとの声（caption・seed）と読み上げON/OFFを設定します（番号選択）\n"
             "`.tts reset` - 設定をすべてデフォルト値に戻します (確認あり)\n"
             "`.tts join` - あなたがいるVC、または設定済みVCに接続します\n"
             "`.tts leave` - ボイスチャンネルから切断します\n"
@@ -797,7 +801,7 @@ async def tts_status(ctx):
     vc_channel_str = get_val_str("vc_channel_id", DEFAULT_SETTINGS["vc_channel_id"], guild_settings.get("vc_channel_id"), is_channel=True)
 
     dict_count = len(guild_settings.get("dict", {}))
-    profile_count = len(guild_settings.get("profiles", {}))
+    profile_count = len(set(guild_settings.get("profiles", {})) | set(guild_settings.get("profile_seeds", {})))
     muted_count = len(guild_settings.get("muted_users", []))
 
     status_text = (
@@ -1122,6 +1126,7 @@ async def tts_profile(ctx):
     max_display = 30
     display_members = members[:max_display]
     muted_users = guild_settings.get("muted_users", [])
+    profile_seeds = guild_settings.get("profile_seeds", {})
 
     lines = []
     for i, m in enumerate(display_members):
@@ -1130,8 +1135,12 @@ async def tts_profile(ctx):
             cap_str = caption[:20] + "…" if len(caption) > 20 else caption
         else:
             cap_str = "デフォルト"
+        seed_str = ""
+        if str(m.id) in profile_seeds:
+            seed_val = profile_seeds[str(m.id)]
+            seed_str = f" seed:{'random' if seed_val is None else seed_val}"
         mute_str = " 🔇読み上げOFF" if m.id in muted_users else ""
-        lines.append(f"{i+1}: {m.display_name} [{cap_str}]{mute_str}")
+        lines.append(f"{i+1}: {m.display_name} [{cap_str}]{seed_str}{mute_str}")
 
     member_list_str = "\n".join(lines)
     suffix = f"\n他 {len(members) - max_display} 人（表示は先頭{max_display}人まで）" if len(members) > max_display else ""
@@ -1149,22 +1158,46 @@ async def tts_profile(ctx):
     target = display_members[num-1]
     current_caption = profiles.get(str(target.id))
     current_str = current_caption if current_caption else "デフォルト（サーバー設定を使用）"
+    if str(target.id) in profile_seeds:
+        seed_val = profile_seeds[str(target.id)]
+        current_seed_str = "ランダム" if seed_val is None else str(seed_val)
+    else:
+        current_seed_str = "デフォルト（サーバー設定を使用）"
     is_muted = target.id in muted_users
     mute_state = "OFF 🔇" if is_muted else "ON 🔊"
 
     await ctx.send(
         f"👤 **{target.display_name}** の現在の設定\n"
-        f"caption: `{current_str}` ／ 読み上げ: {mute_state}\n"
-        f"```\n1: captionを設定\n2: captionをリセット（デフォルトに戻す）\n3: 読み上げのON/OFFを切り替え\n4: キャンセル```\n"
+        f"caption: `{current_str}`\n"
+        f"seed: `{current_seed_str}` ／ 読み上げ: {mute_state}\n"
+        f"```\n1: captionを設定\n2: seedを設定\n3: 読み上げのON/OFFを切り替え\n4: リセット（caption・seedをデフォルトに戻す）\n5: キャンセル```\n"
         f"**操作の番号を返信してください（30秒以内）**"
     )
 
-    action = await wait_for_number(ctx, 4)
+    action = await wait_for_number(ctx, 5)
     if action is None:
         return
 
-    if action == 4:
+    if action == 5:
         await ctx.send("↩️ キャンセルしました。")
+        return
+
+    if action == 4:
+        removed = False
+        if str(target.id) in profiles:
+            del profiles[str(target.id)]
+            removed = True
+        if str(target.id) in profile_seeds:
+            del profile_seeds[str(target.id)]
+            removed = True
+        if removed:
+            guild_settings["profiles"] = profiles
+            guild_settings["profile_seeds"] = profile_seeds
+            settings[str(guild_id)] = guild_settings
+            save_settings(settings)
+            await ctx.send(f"✅ {target.display_name} のcaption・seedをリセットしました。今後はサーバーのデフォルト設定を使用します。")
+        else:
+            await ctx.send(f"ℹ️ {target.display_name} の設定はもともとデフォルトです。変更はありません。")
         return
 
     if action == 3:
@@ -1181,14 +1214,39 @@ async def tts_profile(ctx):
         return
 
     if action == 2:
-        if str(target.id) in profiles:
-            del profiles[str(target.id)]
-            guild_settings["profiles"] = profiles
-            settings[str(guild_id)] = guild_settings
-            save_settings(settings)
-            await ctx.send(f"✅ {target.display_name} のcaptionをリセットしました。今後はサーバーのデフォルトcaptionを使用します。")
+        await ctx.send(
+            f"🎲 {target.display_name} に設定するseed値を入力してください（60秒以内）\n"
+            f"整数（例: `42`）または `random` を指定できます。同じcaptionでもseedによって声が変わります。"
+        )
+
+        def seed_check(message):
+            return message.author == ctx.author and message.channel == ctx.channel
+
+        mark_interactive(ctx)
+        try:
+            reply = await bot.wait_for("message", timeout=60.0, check=seed_check)
+        except asyncio.TimeoutError:
+            await ctx.send("⏰ タイムアウトしました。seed設定をキャンセルします。")
+            return
+        finally:
+            unmark_interactive(ctx)
+
+        value = reply.content.strip()
+        if value.lower() == "random":
+            profile_seeds[str(target.id)] = None
+            seed_disp = "ランダム"
         else:
-            await ctx.send(f"ℹ️ {target.display_name} のcaptionはもともとデフォルトです。変更はありません。")
+            try:
+                profile_seeds[str(target.id)] = int(value)
+                seed_disp = value
+            except ValueError:
+                await ctx.send("❌ エラー: seed値には整数または `random` を指定してください。設定をキャンセルします。")
+                return
+
+        guild_settings["profile_seeds"] = profile_seeds
+        settings[str(guild_id)] = guild_settings
+        save_settings(settings)
+        await ctx.send(f"✅ {target.display_name} のseedを `{seed_disp}` に設定しました。")
         return
 
     # action == 1: prompt for caption text
